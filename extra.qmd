@@ -207,58 +207,58 @@ X_cols <- setdiff(names(df), c("timestamp", "shipping_costs"))
 
 ```{r}
 library(xgboost)
+# ============================================
+# Training Setup (Global XGBoost, no zone_id, with bst_full)
+# ============================================
 
-tr[, X_cols] <- lapply(tr[, X_cols], function(x) {
-  if (is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x
-})
+# remove non-numeric + zone_id
+X_cols <- setdiff(names(train), c("timestamp", "shipping_costs", "zone_id"))
 
-va[, X_cols] <- lapply(va[, X_cols], function(x) {
-  if (is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x
-})
+# ensure all predictors are numeric
+train_x <- train[, X_cols]
+train_x[] <- lapply(train_x, function(col) as.numeric(as.character(col)))
 
-# small validation from tail of training (drives early stopping)
-ntr  <- nrow(train); vcut <- floor(0.9 * ntr)
-tr <- train[1:vcut, ]; va <- train[(vcut+1):ntr, ]
+test_x <- test[, X_cols]
+test_x[] <- lapply(test_x, function(col) as.numeric(as.character(col)))
 
-dtr <- xgb.DMatrix(as.matrix(tr[, X_cols]), label = log1p(tr$shipping_costs))
-dva <- xgb.DMatrix(as.matrix(va[, X_cols]), label = log1p(va$shipping_costs))
+# build matrices
+dtrain <- xgb.DMatrix(as.matrix(train_x), label = log1p(train$shipping_costs))
+dtest  <- xgb.DMatrix(as.matrix(test_x),  label = log1p(test$shipping_costs))
 
+# params
 params <- list(
-  objective        = "reg:squarederror", # (alt: "reg:squaredlogerror")
+  objective        = "reg:squarederror",
   eval_metric      = "rmse",
-  max_depth        = 12,   # more capacity
-  eta              = 0.03, # smaller LR
-  subsample        = 1.0,
-  colsample_bytree = 1.0,
-  min_child_weight = 1,
-  lambda           = 0,
-  alpha            = 0,
-  gamma            = 0
+  max_depth        = 10,
+  eta              = 0.05,
+  subsample        = 0.9,
+  colsample_bytree = 0.9
 )
 
+# 1) train with early stopping
 bst <- xgb.train(
   params = params,
-  data = dtr,
-  nrounds = 5000,                     # high cap; we rely on early stopping
-  watchlist = list(train = dtr, valid = dva),
-  early_stopping_rounds = 200,
+  data = dtrain,
+  nrounds = 5000,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 50,
   print_every_n = 50
 )
 
-# refit on full training using best_iteration
-dtrain <- xgb.DMatrix(as.matrix(train[, X_cols]), label = log1p(train$shipping_costs))
+best_iter <- bst$best_iteration
+
+# 2) retrain on full training data
+dtrain_full <- xgb.DMatrix(as.matrix(train_x), label = log1p(train$shipping_costs))
 bst_full <- xgb.train(
   params = params,
-  data = dtrain,
-  nrounds = bst$best_iteration,
-  watchlist = list(train = dtrain),
-  print_every_n = 200
+  data = dtrain_full,
+  nrounds = best_iter,
+  verbose = 0
 )
 
-```
-
-```{r}
-sapply(tr[, X_cols], class)
+# predictions from bst_full
+preds  <- expm1(predict(bst_full, dtest))
+actual <- test$shipping_costs
 
 ```
 
@@ -300,13 +300,100 @@ p <- ggplot(plot_df, aes(timestamp, value, colour = series)) +
        x = "Time", y = "Shipping costs", colour = "") +
   theme_minimal() +
   theme(legend.position = "bottom")
-ggsave("actual_vs_predicted_hourly_log.png", p, width = 10, height = 4.5, dpi = 150)
 print(p)
 
 
 ```
 
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# build plotting dataframe
+plot_df <- data.frame(
+  timestamp = test$timestamp,
+  actual    = actual,
+  predicted = preds
+)
+
+# plot: predicted line + actual scatter
+p <- ggplot(plot_df, aes(x = timestamp)) +
+  geom_point(aes(y = actual), colour = "black", alpha = 0.6, size = 1.2) +
+  geom_line(aes(y = predicted, colour = "Predicted"), size = 0.9) +
+  labs(
+    title = "Global Model: Actual (scatter) vs Predicted (line)",
+    x = "Time",
+    y = "Shipping Costs",
+    colour = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("global_actual_vs_predicted.png", p, width = 10, height = 5, dpi = 150)
+print(p)
+
+```
+
 ### Part 2- Zone-Level Forecasting
+
+```{r}
+library(readr); library(dplyr); library(lubridate)
+
+raw <- read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
+  mutate(timestamp = ymd_hms(timestamp, quiet = TRUE))
+
+# keep rows with GPS
+raw_gps <- raw %>%
+  filter(!is.na(vehicle_gps_latitude), !is.na(vehicle_gps_longitude)) %>%
+  select(timestamp, shipping_costs,
+         traffic_congestion_level, port_congestion_level,
+         fuel_consumption_rate, loading_unloading_time,
+         supplier_reliability_score,
+         vehicle_gps_latitude, vehicle_gps_longitude)
+
+# cluster GPS into zones at the ROW level (no join-on-timestamp)
+set.seed(42)
+k <- 8  # adjust if you want
+km <- kmeans(raw_gps[, c("vehicle_gps_latitude","vehicle_gps_longitude")], centers = k)
+raw_gps$zone_id <- paste0("Z", km$cluster)
+
+library(tidyr); library(zoo)
+
+zone_hourly <- raw_gps %>%
+  group_by(timestamp, zone_id) %>%
+  summarise(
+    shipping_costs = sum(shipping_costs, na.rm = TRUE),             # sum cost per zone-hour
+    traffic_congestion_level = mean(traffic_congestion_level, na.rm = TRUE),
+    port_congestion_level    = mean(port_congestion_level, na.rm = TRUE),
+    fuel_consumption_rate    = mean(fuel_consumption_rate, na.rm = TRUE),
+    loading_unloading_time   = mean(loading_unloading_time, na.rm = TRUE),
+    supplier_reliability_score = mean(supplier_reliability_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(zone_id, timestamp) %>%
+  mutate(
+    # time features
+    hour  = hour(timestamp),
+    dow   = wday(timestamp),
+    month = month(timestamp),
+    sin_hr = sin(2*pi*hour/24),  cos_hr = cos(2*pi*hour/24),
+    sin_dw = sin(2*pi*dow/7),    cos_dw = cos(2*pi*dow/7),
+
+    # zone-wise lags (computed within each zone)
+    shipping_costs_lag1  = lag(shipping_costs, 1),
+    shipping_costs_lag24 = lag(shipping_costs, 24)
+  ) %>%
+  group_by(zone_id) %>%
+  # drop initial rows without lags per zone
+  drop_na(shipping_costs_lag1, shipping_costs_lag24) %>%
+  ungroup()
+
+# write a clean timestamp without "Z"
+zone_hourly_out <- zone_hourly %>%
+  mutate(timestamp = format(timestamp, "%Y-%m-%d %H:%M:%S"))
+write_csv(zone_hourly_out, "shipping_costs_zone_hourly.csv")
+```
 
 ```{r}
 # ============================================
@@ -416,6 +503,9 @@ pred_df <- tibble::tibble(
 )
 
 write_csv(pred_df, "zone_predictions_highcap.csv")
+global_metrics <- metric_fun(pred_df$predicted, pred_df$actual)
+print(global_metrics)
+
 
 # ---- 7) Metrics ----
 eps <- 1e-9
@@ -489,7 +579,7 @@ colnames(Y_act)  <- zones
 ```
 
 ```{r}
-{r}
+
 # ============================================
 # B) Reconciliation
 # ============================================
@@ -591,8 +681,8 @@ total_metrics <- bind_rows(
   metric_fun(totals$Shrink, totals$actual) %>% mutate(method="Shrink")
 )
 
-write_csv(total_metrics, "total_metrics_reconciled_simple.csv")
 print(total_metrics)
+
 
 
 # ---- BU plot ----
