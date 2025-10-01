@@ -4,6 +4,103 @@ format: html
 editor: visual
 ---
 
+### EDA
+
+```{r}
+# ==== EDA (robust to missing column names) ====
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(corrplot)
+
+df <- read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
+  mutate(timestamp = ymd_hms(timestamp, quiet = TRUE))
+
+theme_set(theme_minimal(base_size = 9))
+small_theme <- theme(
+  plot.title  = element_text(size = 10, face = "bold"),
+  axis.title  = element_text(size = 9),
+  axis.text   = element_text(size = 8),
+  strip.text  = element_text(size = 8),
+  legend.text = element_text(size = 8),
+  legend.title= element_text(size = 9)
+)
+
+# --- Identify key columns safely ---
+time_col   <- intersect(c("timestamp", "datetime", "date", "time"), names(df))[1]
+target_col <- intersect(c("shipping_costs", "target", "y"), names(df))[1]
+if (is.na(target_col)) stop("No target column found. Expected one of: 'shipping_costs', 'target', 'y'.")
+
+# 1) Quick overview
+glimpse(df)
+summary(df[[target_col]])
+
+# 2) Target distribution
+ggplot(df, aes(x = .data[[target_col]])) +
+  geom_histogram(bins = 50) +
+  labs(title = paste("Distribution of", target_col), x = target_col, y = "Count") +
+  theme_minimal()
+
+# 3) Time series trend (only if timestamp-like column exists)
+if (!is.na(time_col)) {
+  ggplot(df, aes(x = .data[[time_col]], y = .data[[target_col]])) +
+    geom_line() +
+    labs(title = paste(target_col, "Over Time"), x = time_col, y = target_col) +
+    theme_minimal()
+}
+
+# ---- 4) Predictor distributions (FACETED — smaller text only) ----
+num_pred <- df %>%
+  select(where(is.numeric)) %>%
+  select(-all_of(target_col))
+
+if (ncol(num_pred) > 0) {
+  num_long <- num_pred %>%
+    pivot_longer(everything(), names_to = "feature", values_to = "value")
+
+  ggplot(num_long, aes(x = value)) +
+    geom_histogram(bins = 30) +
+    facet_wrap(~ feature, scales = "free_x") +
+    labs(title = "Distributions of Numeric Predictors", x = NULL, y = "Count") +
+    theme_minimal(base_size = 8) +                                     # smaller base text
+    theme(
+      plot.title = element_text(size = 9, face = "bold"),
+      axis.title = element_text(size = 8),
+      axis.text  = element_text(size = 7),
+      strip.text = element_text(size = 7)                              # smaller facet labels
+    )
+}
+
+# 5) Relationships with target (scatter + linear trend)
+if (ncol(num_pred) > 0) {
+  rel_long <- bind_cols(df %>% select(all_of(target_col)), num_pred) %>%
+    pivot_longer(-all_of(target_col), names_to = "feature", values_to = "value")
+
+  ggplot(rel_long, aes(x = value, y = .data[[target_col]])) +
+    geom_point(alpha = 0.35, size = 0.5) +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~ feature, scales = "free_x") +
+    labs(title = paste(target_col, "vs Numeric Predictors"), x = NULL, y = target_col) +
+    theme_minimal()
+}
+
+# 6) Correlation heatmap (numeric only; drop constant columns)
+num_for_cor <- df %>%
+  select(where(is.numeric)) %>%
+  select(where(~ sd(.x, na.rm = TRUE) > 0))
+
+if (ncol(num_for_cor) > 1) {
+  cor_mat <- cor(num_for_cor, use = "pairwise.complete.obs")
+  corrplot(cor_mat,
+           method = "color",
+           type   = "upper",
+           tl.col = "black",
+           tl.cex = 0.5,
+           mar    = c(0,0,1,0),
+           title  = "Correlation Heatmap (Numeric Features)")
+}
+```
+
 ### Part 1 - Global Forecasting
 
 ```{r}
