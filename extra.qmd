@@ -1,0 +1,107 @@
+---
+title: "Model"
+format: html
+editor: visual
+---
+
+```{r}
+library(readr); library(dplyr); library(lubridate)
+
+raw <- read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE) %>%
+  mutate(timestamp = ymd_hms(timestamp, quiet = TRUE))
+
+raw_gps <- raw %>%
+  filter(!is.na(vehicle_gps_latitude), !is.na(vehicle_gps_longitude)) %>%
+  select(timestamp, shipping_costs,
+         traffic_congestion_level, port_congestion_level,
+         fuel_consumption_rate, loading_unloading_time,
+         supplier_reliability_score,
+         vehicle_gps_latitude, vehicle_gps_longitude)
+
+set.seed(42)
+k <- 8
+km <- kmeans(raw_gps[, c("vehicle_gps_latitude","vehicle_gps_longitude")], centers = k)
+raw_gps$zone_id <- paste0("Z", km$cluster)
+
+library(tidyr); library(zoo)
+
+zone_hourly <- raw_gps %>%
+  group_by(timestamp, zone_id) %>%
+  summarise(
+    shipping_costs = sum(shipping_costs, na.rm = TRUE),            
+    traffic_congestion_level = mean(traffic_congestion_level, na.rm = TRUE),
+    port_congestion_level    = mean(port_congestion_level, na.rm = TRUE),
+    fuel_consumption_rate    = mean(fuel_consumption_rate, na.rm = TRUE),
+    loading_unloading_time   = mean(loading_unloading_time, na.rm = TRUE),
+    supplier_reliability_score = mean(supplier_reliability_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(zone_id, timestamp) %>%
+  mutate(
+    # time features
+    hour  = hour(timestamp),
+    dow   = wday(timestamp),
+    month = month(timestamp),
+    sin_hr = sin(2*pi*hour/24),  cos_hr = cos(2*pi*hour/24),
+    sin_dw = sin(2*pi*dow/7),    cos_dw = cos(2*pi*dow/7),
+
+    # zone-wise lags (computed within each zone)
+    shipping_costs_lag1  = lag(shipping_costs, 1),
+    shipping_costs_lag24 = lag(shipping_costs, 24)
+  ) %>%
+  group_by(zone_id) %>%
+  drop_na(shipping_costs_lag1, shipping_costs_lag24) %>%
+  ungroup()
+
+zone_hourly_out <- zone_hourly %>%
+  mutate(timestamp = format(timestamp, "%Y-%m-%d %H:%M:%S"))
+write_csv(zone_hourly_out, "shipping_costs_zone_real.csv")
+
+```
+
+```{r}
+library(readr); library(dplyr); library(lubridate); library(zoo)
+
+set.seed(42)
+
+df <- read_csv("shipping_costs_zone_real", show_col_types = FALSE) %>%
+  mutate(
+    timestamp = ymd_hms(timestamp, quiet = TRUE),
+    shipping_costs = as.numeric(shipping_costs)
+  ) %>%
+  arrange(timestamp)
+
+df <- df %>%
+  mutate(
+    # lags
+    lag1  = lag(shipping_costs, 1),
+    lag2  = lag(shipping_costs, 2),
+    lag3  = lag(shipping_costs, 3),
+    lag6  = lag(shipping_costs, 6),
+    lag12 = lag(shipping_costs, 12),
+    lag24 = lag(shipping_costs, 24),
+    lag48 = lag(shipping_costs, 48),
+    lag72 = lag(shipping_costs, 72),
+
+    # volatility / change features
+    shipping_costs_diff1  = shipping_costs - lag1,
+    shipping_costs_diff24 = shipping_costs - lag24,
+
+    # rolling 24h stats
+    roll_mean_24 = rollmeanr(shipping_costs, k = 24, fill = NA),
+    roll_sd_24   = rollapplyr(shipping_costs, 24, sd,  fill = NA),
+    roll_max_24  = rollapplyr(shipping_costs, 24, max, fill = NA),
+    roll_min_24  = rollapplyr(shipping_costs, 24, min, fill = NA)
+  ) %>%
+  tidyr::drop_na()
+
+# feature list
+X_cols <- setdiff(names(df), c("timestamp", "shipping_costs"))
+
+# 80/20 time-based split
+n   <- nrow(df)
+cut <- floor(0.8 * n)
+train_df <- df[1:cut, ]
+test_df  <- df[(cut+1):n, ]
+
+```
