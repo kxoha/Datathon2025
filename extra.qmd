@@ -4,6 +4,8 @@ format: html
 editor: visual
 ---
 
+### Part 1 - Global Forecasting
+
 ```{r}
 library(readr); library(dplyr); library(lubridate)
 
@@ -55,25 +57,25 @@ zone_hourly <- raw_gps %>%
 
 zone_hourly_out <- zone_hourly %>%
   mutate(timestamp = format(timestamp, "%Y-%m-%d %H:%M:%S"))
-write_csv(zone_hourly_out, "shipping_costs_zone_real.csv")
+write_csv(zone_hourly_out, "shipping_costs.csv")
 
 ```
 
 ```{r}
 library(readr); library(dplyr); library(lubridate); library(zoo)
 
-set.seed(42)
-
-df <- read_csv("shipping_costs_zone_real", show_col_types = FALSE) %>%
+# 1) load
+df <- read_csv("shipping_costs.csv", show_col_types = FALSE) %>%
   mutate(
     timestamp = ymd_hms(timestamp, quiet = TRUE),
     shipping_costs = as.numeric(shipping_costs)
   ) %>%
   arrange(timestamp)
 
+# 2) richer lags + volatility
 df <- df %>%
   mutate(
-    # lags
+    # extra lags (short, daily, multi-day)
     lag1  = lag(shipping_costs, 1),
     lag2  = lag(shipping_costs, 2),
     lag3  = lag(shipping_costs, 3),
@@ -83,25 +85,447 @@ df <- df %>%
     lag48 = lag(shipping_costs, 48),
     lag72 = lag(shipping_costs, 72),
 
-    # volatility / change features
-    shipping_costs_diff1  = shipping_costs - lag1,
-    shipping_costs_diff24 = shipping_costs - lag24,
+    # volatility / changes
+    diff1  = shipping_costs - lag1,
+    diff24 = shipping_costs - lag24,
 
-    # rolling 24h stats
-    roll_mean_24 = rollmeanr(shipping_costs, k = 24, fill = NA),
+    # rolling stats (24h)
+    roll_mean_24 = rollmeanr(shipping_costs, 24, fill = NA),
     roll_sd_24   = rollapplyr(shipping_costs, 24, sd,  fill = NA),
     roll_max_24  = rollapplyr(shipping_costs, 24, max, fill = NA),
     roll_min_24  = rollapplyr(shipping_costs, 24, min, fill = NA)
   ) %>%
-  tidyr::drop_na()
+  tidyr::drop_na()  # drop initial rows without lags/rolls
 
-# feature list
-X_cols <- setdiff(names(df), c("timestamp", "shipping_costs"))
-
-# 80/20 time-based split
+# 3) split
 n   <- nrow(df)
 cut <- floor(0.8 * n)
-train_df <- df[1:cut, ]
-test_df  <- df[(cut+1):n, ]
+train <- df[1:cut, ]
+test  <- df[(cut+1):n, ]
+
+# 4) features = everything except timestamp + raw target
+X_cols <- setdiff(names(df), c("timestamp", "shipping_costs"))
+
+```
+
+```{r}
+library(xgboost)
+
+tr[, X_cols] <- lapply(tr[, X_cols], function(x) {
+  if (is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x
+})
+
+va[, X_cols] <- lapply(va[, X_cols], function(x) {
+  if (is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x
+})
+
+# small validation from tail of training (drives early stopping)
+ntr  <- nrow(train); vcut <- floor(0.9 * ntr)
+tr <- train[1:vcut, ]; va <- train[(vcut+1):ntr, ]
+
+dtr <- xgb.DMatrix(as.matrix(tr[, X_cols]), label = log1p(tr$shipping_costs))
+dva <- xgb.DMatrix(as.matrix(va[, X_cols]), label = log1p(va$shipping_costs))
+
+params <- list(
+  objective        = "reg:squarederror", # (alt: "reg:squaredlogerror")
+  eval_metric      = "rmse",
+  max_depth        = 12,   # more capacity
+  eta              = 0.03, # smaller LR
+  subsample        = 1.0,
+  colsample_bytree = 1.0,
+  min_child_weight = 1,
+  lambda           = 0,
+  alpha            = 0,
+  gamma            = 0
+)
+
+bst <- xgb.train(
+  params = params,
+  data = dtr,
+  nrounds = 5000,                     # high cap; we rely on early stopping
+  watchlist = list(train = dtr, valid = dva),
+  early_stopping_rounds = 200,
+  print_every_n = 50
+)
+
+# refit on full training using best_iteration
+dtrain <- xgb.DMatrix(as.matrix(train[, X_cols]), label = log1p(train$shipping_costs))
+bst_full <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = bst$best_iteration,
+  watchlist = list(train = dtrain),
+  print_every_n = 200
+)
+
+```
+
+```{r}
+sapply(tr[, X_cols], class)
+
+```
+
+```{r}
+library(ggplot2); library(tidyr); library(dplyr)
+
+dtest <- xgb.DMatrix(as.matrix(test[, X_cols]))
+preds_log <- predict(bst_full, dtest)
+preds     <- expm1(preds_log)         
+actual    <- test$shipping_costs
+
+# metrics
+eps <- 1e-9
+rmse  <- sqrt(mean((preds - actual)^2, na.rm = TRUE))
+mae   <- mean(abs(preds - actual), na.rm = TRUE)
+mape  <- mean(abs((preds - actual) / pmax(actual, eps)), na.rm = TRUE) * 100
+smape <- mean(2 * abs(preds - actual) / (abs(preds) + abs(actual) + eps), na.rm = TRUE) * 100
+r2    <- {
+  ss_res <- sum((actual - preds)^2, na.rm = TRUE)
+  ss_tot <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
+  1 - ss_res/(ss_tot + eps)
+}
+
+eval_tbl <- data.frame(RMSE = rmse, MAE = mae, MAPE = mape, sMAPE = smape, R2 = r2)
+print(eval_tbl)
+readr::write_csv(eval_tbl, "metrics_hourly_log_highcap.csv")
+
+pred_df <- tibble::tibble(
+  timestamp = test$timestamp,
+  actual = actual,
+  predicted = preds
+)
+
+# simple overlay plot 
+plot_df <- pred_df %>% pivot_longer(c(actual, predicted), names_to="series", values_to="value")
+p <- ggplot(plot_df, aes(timestamp, value, colour = series)) +
+  geom_line(alpha = 0.85) +
+  labs(title = "Shipping costs — actual vs predicted (hourly, log-target)",
+       x = "Time", y = "Shipping costs", colour = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("actual_vs_predicted_hourly_log.png", p, width = 10, height = 4.5, dpi = 150)
+print(p)
+
+
+```
+
+### Part 2- Zone-Level Forecasting
+
+```{r}
+# ============================================
+# Global XGBoost with zones
+# ============================================
+library(readr); library(dplyr); library(lubridate); library(zoo)
+library(xgboost); library(ggplot2); library(tidyr)
+
+# ---- 1) Load zone-level data ----
+df <- read_csv("shipping_costs_zone_hourly.csv", show_col_types = FALSE) %>%
+  mutate(timestamp = ymd_hms(timestamp, quiet = TRUE)) %>%
+  arrange(zone_id, timestamp)
+
+# ---- 2) Add richer features per zone ----
+df <- df %>%
+  group_by(zone_id) %>%
+  arrange(timestamp, .by_group = TRUE) %>%
+  mutate(
+    lag1  = lag(shipping_costs, 1),
+    lag2  = lag(shipping_costs, 2),
+    lag3  = lag(shipping_costs, 3),
+    lag6  = lag(shipping_costs, 6),
+    lag12 = lag(shipping_costs, 12),
+    lag24 = lag(shipping_costs, 24),
+    lag48 = lag(shipping_costs, 48),
+    lag72 = lag(shipping_costs, 72),
+
+    diff1  = shipping_costs - lag1,
+    diff24 = shipping_costs - lag24,
+
+    roll_mean_24 = rollmeanr(shipping_costs, 24, fill = NA),
+    roll_sd_24   = rollapplyr(shipping_costs, 24, sd,  fill = NA),
+    roll_max_24  = rollapplyr(shipping_costs, 24, max, fill = NA),
+    roll_min_24  = rollapplyr(shipping_costs, 24, min, fill = NA)
+  ) %>%
+  ungroup() %>%
+  tidyr::drop_na()
+
+# ---- 3) One-hot encode zone_id BUT keep original ----
+zone_dummies <- model.matrix(~ zone_id - 1, data = df)
+df_enc <- cbind(df, zone_dummies)   # keep original zone_id column
+
+# ---- 4) Train/test split (by time) ----
+n   <- nrow(df_enc)
+# ---- 4) Train/test split (by time, across all zones) ----
+time_cut <- quantile(df_enc$timestamp, 0.8)   # 80% by time
+
+train <- df_enc %>% filter(timestamp <= time_cut)
+test  <- df_enc %>% filter(timestamp >  time_cut)
+
+X_cols <- setdiff(names(df_enc), c("timestamp","shipping_costs","zone_id"))
+
+
+X_cols <- setdiff(names(df_enc), c("timestamp","shipping_costs","zone_id"))
+
+# validation from last 10% of training
+ntr <- nrow(train); vcut <- floor(0.9 * ntr)
+tr <- train[1:vcut, ]; va <- train[(vcut+1):ntr, ]
+
+dtr <- xgb.DMatrix(as.matrix(tr[, X_cols]), label = log1p(tr$shipping_costs))
+dva <- xgb.DMatrix(as.matrix(va[, X_cols]), label = log1p(va$shipping_costs))
+```
+
+```{r}
+# ---- 5) Train model (high capacity + log target) ----
+params <- list(
+  objective        = "reg:squarederror",
+  eval_metric      = "rmse",
+  max_depth        = 12,
+  eta              = 0.03,
+  subsample        = 1.0,
+  colsample_bytree = 1.0,
+  min_child_weight = 1,
+  lambda           = 0,
+  alpha            = 0,
+  gamma            = 0
+)
+
+bst <- xgb.train(
+  params = params,
+  data = dtr,
+  nrounds = 5000,
+  watchlist = list(train = dtr, valid = dva),
+  early_stopping_rounds = 200,
+  print_every_n = 50
+)
+
+# Refit
+dtrain <- xgb.DMatrix(as.matrix(train[, X_cols]), label = log1p(train$shipping_costs))
+bst_full <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = bst$best_iteration,
+  verbose = 0
+)
+
+# ---- 6) Predictions ----
+dtest <- xgb.DMatrix(as.matrix(test[, X_cols]))
+preds <- expm1(predict(bst_full, dtest))
+actual <- test$shipping_costs
+
+pred_df <- tibble::tibble(
+  timestamp = test$timestamp,
+  zone_id   = test$zone_id,   
+  actual    = actual,
+  predicted = preds
+)
+
+write_csv(pred_df, "zone_predictions_highcap.csv")
+
+# ---- 7) Metrics ----
+eps <- 1e-9
+metric_fun <- function(pred, act) {
+  data.frame(
+    RMSE  = sqrt(mean((pred - act)^2, na.rm = TRUE)),
+    MAE   = mean(abs(pred - act), na.rm = TRUE),
+    MAPE  = mean(abs((pred - act) / pmax(abs(act), eps)), na.rm = TRUE) * 100,
+    sMAPE = mean(2 * abs(pred - act) / (abs(pred) + abs(act) + eps), na.rm = TRUE) * 100,
+    R2    = {
+      ss_res <- sum((act - pred)^2, na.rm = TRUE)
+      ss_tot <- sum((act - mean(act, na.rm = TRUE))^2, na.rm = TRUE)
+      1 - ss_res / (ss_tot + eps)
+    }
+  )
+}
+
+zone_metrics <- pred_df %>%
+  group_by(zone_id) %>%
+  summarise(metric_fun(predicted, actual), .groups="drop")
+
+write_csv(zone_metrics, "zone_metrics_highcap.csv")
+print(zone_metrics)
+
+# ---- 8) Plot (faceted per zone) ----
+plot_df <- pred_df %>%
+  pivot_longer(cols = c(actual, predicted), names_to = "series", values_to = "value")
+
+p <- ggplot(plot_df, aes(timestamp, value, colour = series)) +
+  geom_line(alpha=0.8) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Zone-level forecasts (log target, high-capacity XGB)",
+       x="Time", y="Shipping Costs", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+ggsave("zone_forecasts_highcap.png", p, width=12, height=8, dpi=150)
+
+```
+
+### Part 3 - Forecasting Reconciliation (BU, TD, Shrinkage)
+
+Comparison of reconciliation methods and their impact on coherence and accuracy.
+
+```{r}
+# ============================================
+# A) Setup
+# ============================================
+library(readr); library(dplyr); library(tidyr); library(lubridate); library(ggplot2)
+
+pred_df <- read_csv("zone_predictions_highcap.csv", show_col_types = FALSE) %>%
+  mutate(timestamp = ymd_hms(timestamp, quiet = TRUE)) %>%
+  arrange(timestamp, zone_id)
+
+pred_wide <- pred_df %>%
+  select(timestamp, zone_id, actual, predicted) %>%
+  pivot_wider(
+    id_cols = timestamp,
+    names_from = zone_id,
+    values_from = c(actual, predicted)
+  ) %>%
+  arrange(timestamp)
+
+Yhat_B <- as.matrix(pred_wide %>% select(starts_with("predicted_")))
+Y_act  <- as.matrix(pred_wide %>% select(starts_with("actual_")))
+timestamps <- pred_wide$timestamp
+
+zones <- gsub("predicted_", "", colnames(Yhat_B))
+colnames(Yhat_B) <- zones
+colnames(Y_act)  <- zones
+```
+
+```{r}
+{r}
+# ============================================
+# B) Reconciliation
+# ============================================
+
+# ---- Bottom-Up ----
+Yhat_bu_bottom <- Yhat_B
+Yhat_bu_total  <- rowSums(Yhat_bu_bottom, na.rm=TRUE)
+
+# ---- Top-Down ----
+Yhat_total <- rowSums(Yhat_B, na.rm=TRUE)
+zone_means <- colMeans(Y_act, na.rm=TRUE)
+
+if (all(is.na(zone_means)) || sum(zone_means, na.rm=TRUE) <= 0) {
+  props <- rep(1/length(zone_means), length(zone_means))
+} else {
+  props <- zone_means / sum(zone_means, na.rm=TRUE)
+}
+props[is.na(props)] <- 1/length(props)
+props <- props / sum(props)
+
+Yhat_td_bottom <- sweep(matrix(Yhat_total, nrow=length(Yhat_total), ncol=length(props)),
+                        2, props, `*`)
+Yhat_td_total <- rowSums(Yhat_td_bottom)
+
+# ---- Shrinkage ----
+alpha <- 0.5
+Yhat_shrink_bottom <- alpha * Yhat_bu_bottom + (1 - alpha) * Yhat_td_bottom
+Yhat_shrink_total  <- rowSums(Yhat_shrink_bottom)
+
+
+```
+
+```{r}
+
+# ============================================
+# C) Metrics + Plots (safe)
+# ============================================
+
+eps <- 1e-9
+metric_fun <- function(pred, act) {
+  # Replace NA with 0
+  act <- ifelse(is.na(act), 0, act)
+  pred <- ifelse(is.na(pred), 0, pred)
+
+  ss_res <- sum((act - pred)^2, na.rm=TRUE)
+  ss_tot <- sum((act - mean(act, na.rm=TRUE))^2, na.rm=TRUE)
+
+  data.frame(
+    RMSE  = sqrt(mean((pred-act)^2, na.rm=TRUE)),
+    MAE   = mean(abs(pred-act), na.rm=TRUE),
+    MAPE  = ifelse(sum(abs(act), na.rm=TRUE) == 0, NA,
+                   mean(abs((pred-act)/(act+eps)), na.rm=TRUE) * 100),
+    sMAPE = mean(2*abs(pred-act)/(abs(pred)+abs(act)+eps), na.rm=TRUE) * 100,
+    R2    = ifelse(ss_tot == 0, NA, 1 - ss_res/(ss_tot+eps))
+  )
+}
+
+act_long <- as.data.frame(Y_act)
+colnames(act_long) <- zones
+act_long <- cbind(timestamp=timestamps, act_long) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="actual")
+
+long_bu <- cbind(timestamp=timestamps, as.data.frame(Yhat_bu_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_bu")
+
+long_td <- cbind(timestamp=timestamps, as.data.frame(Yhat_td_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_td")
+
+long_shrink <- cbind(timestamp=timestamps, as.data.frame(Yhat_shrink_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_shrink")
+
+compare <- act_long %>%
+  left_join(long_bu, by=c("timestamp","zone_id")) %>%
+  left_join(long_td, by=c("timestamp","zone_id")) %>%
+  left_join(long_shrink, by=c("timestamp","zone_id"))
+
+zone_metrics <- compare %>%
+  group_by(zone_id) %>%
+  summarise(
+    metric_fun(pred_bu,     actual) %>% setNames(paste0(names(.),"_BU")),
+    metric_fun(pred_td,     actual) %>% setNames(paste0(names(.),"_TD")),
+    metric_fun(pred_shrink, actual) %>% setNames(paste0(names(.),"_Shrink")),
+    .groups="drop"
+)
+
+write_csv(zone_metrics, "zone_metrics_reconciled_simple.csv")
+print(zone_metrics)
+
+totals <- data.frame(
+  actual = rowSums(Y_act, na.rm=TRUE),
+  BU     = Yhat_bu_total,
+  TD     = Yhat_td_total,
+  Shrink = Yhat_shrink_total
+)
+
+total_metrics <- bind_rows(
+  metric_fun(totals$BU, totals$actual)     %>% mutate(method="BU"),
+  metric_fun(totals$TD, totals$actual)     %>% mutate(method="TD"),
+  metric_fun(totals$Shrink, totals$actual) %>% mutate(method="Shrink")
+)
+
+write_csv(total_metrics, "total_metrics_reconciled_simple.csv")
+print(total_metrics)
+
+
+# ---- BU plot ----
+p_bu <- ggplot(compare, aes(timestamp)) +
+  geom_line(aes(y=actual), colour="black", linetype="dashed", size=0.6) +
+  geom_line(aes(y=pred_bu, colour="BU"), size=0.8) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Bottom-Up vs Actual", y="Shipping Costs", x="Time", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+ggsave("zone_forecasts_BU.png", p_bu, width=12, height=8, dpi=150)
+
+# ---- TD plot ----
+p_td <- ggplot(compare, aes(timestamp)) +
+  geom_line(aes(y=actual), colour="black", linetype="dashed", size=0.6) +
+  geom_line(aes(y=pred_td, colour="TD"), size=0.8) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Top-Down vs Actual", y="Shipping Costs", x="Time", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+ggsave("zone_forecasts_TD.png", p_td, width=12, height=8, dpi=150)
+
+# ---- Shrinkage plot ----
+p_shrink <- ggplot(compare, aes(timestamp)) +
+  geom_line(aes(y=actual), colour="black", linetype="dashed", size=0.6) +
+  geom_line(aes(y=pred_shrink, colour="Shrinkage"), size=0.8) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Shrinkage vs Actual", y="Shipping Costs", x="Time", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+ggsave("zone_forecasts_Shrinkage.png", p_shrink, width=12, height=8, dpi=150)
 
 ```
