@@ -716,3 +716,237 @@ p_shrink <- ggplot(compare, aes(timestamp)) +
 ggsave("zone_forecasts_Shrinkage.png", p_shrink, width=12, height=8, dpi=150)
 
 ```
+
+Plots
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(viridis)
+
+# Filter to recent test period (e.g., last 30 days)
+plot_df <- pred_df %>%
+  filter(timestamp >= max(timestamp, na.rm = TRUE) - days(3)) %>%
+  pivot_longer(cols = c(actual, predicted), names_to = "Series", values_to = "Value")
+
+# Plot: scatter for actuals, line for predictions
+p <- ggplot(plot_df, aes(x = timestamp, y = Value, color = Series)) +
+  geom_point(data = filter(plot_df, Series == "actual"), alpha = 0.5, size = 1) +
+  geom_line(data = filter(plot_df, Series == "predicted"), size = 1, alpha = 0.4) +
+  scale_color_viridis_d(option = "plasma", begin = 0.2, end = 0.8) +
+  labs(
+    title = "Actual vs Predicted Shipping Costs (Recent 72 Hour Period)",
+    x = "Time",
+    y = "Shipping Costs") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+# Optional: facet by zone if zone_id exists
+if ("zone_id" %in% names(pred_df)) {
+  p <- p + facet_wrap(~ zone_id, scales = "free_y", ncol = 4)
+}
+
+# Save and display
+ggsave("actual_vs_predicted_viridis.png", plot = p, width = 14, height = 8, dpi = 150)
+print(p)
+
+
+
+```
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(viridis)
+
+# Ensure timestamp is POSIXct
+residuals_df <- data.frame(
+  timestamp  = as.POSIXct(test$timestamp),
+  residuals  = preds - actual
+)
+
+# Filter to last 2 months
+last_months <- residuals_df %>%
+  filter(timestamp >= max(timestamp, na.rm = TRUE) - months(2))
+
+# Plot residuals over time with Viridis color
+p <- ggplot(last_months, aes(x = timestamp, y = residuals, color = residuals)) +
+  geom_line(alpha = 0.6, linewidth = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "gray40", linetype = "dotted") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_color_viridis_c(option = "plasma") +
+  labs(
+    title = "Residuals Over Time (Predicted − Actual)",
+    subtitle = "Last 2 Months of Forecast Errors",
+    x = "Timestamp",
+    y = "Residuals",
+    color = "Residual Value"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+# Save and display
+ggsave("residuals_last2months_viridis.png", p, width = 12, height = 6, dpi = 150)
+print(p)
+
+
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(viridis)
+
+# Assuming you have a dataframe with timestamp, actual, predicted
+global_df <- data.frame(
+  timestamp = test$timestamp,
+  actual = test$shipping_costs,
+  predicted = preds
+)
+
+# Filter to past 72 hours
+plot_df <- global_df %>%
+  filter(timestamp >= max(timestamp, na.rm = TRUE) - hours(72)) %>%
+  pivot_longer(cols = c(actual, predicted), names_to = "Series", values_to = "Value")
+
+# Plot: scatter for actuals, line for predictions
+p <- ggplot(plot_df, aes(x = timestamp, y = Value, color = Series)) +
+  geom_point(data = filter(plot_df, Series == "actual"), alpha = 0.6, size = 1.5) +
+  geom_line(data = filter(plot_df, Series == "predicted"), size = 1.2, alpha = 0.7) +
+  scale_color_viridis_d(option = "viridis", begin = 0.2, end = 0.8) +
+  labs(
+    title = "Global Forecast: Actual vs Predicted Shipping Costs",
+    subtitle = "Past 72 Hours",
+    x = "Timestamp",
+    y = "Shipping Costs") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+# Save and display
+ggsave("global_forecast_72hr_viridis.png", plot = p, width = 12, height = 6, dpi = 150)
+print(p)
+
+
+
+
+
+```
+
+```{r}
+long_shrink <- cbind(timestamp=timestamps, as.data.frame(Yhat_shrink_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_shrink")
+
+plot_shrink <- act_long %>%
+  left_join(long_shrink, by=c("timestamp","zone_id")) %>%
+  filter(timestamp >= max(timestamp) - lubridate::hours(72))
+
+ggplot(plot_shrink, aes(x=timestamp)) +
+  geom_point(aes(y=actual), colour="black", alpha=0.6, size=1.2) +
+  geom_line(aes(y=pred_shrink, colour="Shrinkage Predicted"), size=0.9) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Shrinkage Reconciled Forecasts (Last 72 Hours)",
+       x="Time", y="Shipping Costs", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+
+
+```
+
+```{r}
+long_td <- cbind(timestamp=timestamps, as.data.frame(Yhat_td_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_td")
+
+plot_td <- act_long %>%
+  left_join(long_td, by=c("timestamp","zone_id")) %>%
+  filter(timestamp >= max(timestamp) - lubridate::hours(72))
+
+ggplot(plot_td, aes(x=timestamp)) +
+  geom_point(aes(y=actual), colour="black", alpha=0.6, size=1.2) +
+  geom_line(aes(y=pred_td, colour="TD Predicted"), size=0.9) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Top-Down Reconciled Forecasts (Last 72 Hours)",
+       x="Time", y="Shipping Costs", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+```
+
+```{r}
+# Actuals long form
+act_long <- as.data.frame(Y_act)
+colnames(act_long) <- zones
+act_long <- cbind(timestamp=timestamps, act_long) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="actual")
+
+# BU reconciled forecasts
+long_bu <- cbind(timestamp=timestamps, as.data.frame(Yhat_bu_bottom)) %>%
+  pivot_longer(-timestamp, names_to="zone_id", values_to="pred_bu")
+
+# Merge and filter last 72h
+plot_bu <- act_long %>%
+  left_join(long_bu, by=c("timestamp","zone_id")) %>%
+  filter(timestamp >= max(timestamp) - lubridate::hours(72))
+
+ggplot(plot_bu, aes(x=timestamp)) +
+  geom_point(aes(y=actual), colour="black", alpha=0.6, size=1.2) +
+  geom_line(aes(y=pred_bu, colour="BU Predicted"), size=0.9) +
+  facet_wrap(~ zone_id, scales="free_y") +
+  labs(title="Bottom-Up Reconciled Forecasts (Last 72 Hours)",
+       x="Time", y="Shipping Costs", colour="") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(viridis)
+library(tidyr)
+
+# Filter to last 72 hours
+zone_last72 <- pred_df %>%
+  filter(timestamp >= max(timestamp, na.rm = TRUE) - hours(72)) %>%
+  pivot_longer(cols = c(actual, predicted), names_to = "Series", values_to = "Value")
+
+# Plot: scatter for actuals, line for predictions, faceted by zone
+ggplot(zone_last72, aes(x = timestamp, y = Value, color = Series)) +
+  geom_point(data = filter(zone_last72, Series == "actual"), alpha = 0.6, size = 1.2) +
+  geom_line(data = filter(zone_last72, Series == "predicted"), size = 0.9) +
+  scale_color_viridis_d(option = "magma", begin = 0.2, end = 0.8) +
+  facet_wrap(~ zone_id, scales = "free_y") +
+  labs(
+    title = "Zone-Level Forecasts (Last 72 Hours)",
+    subtitle = "Scatter = Actual, Line = Predicted",
+    x = "Time",
+    y = "Shipping Costs",
+    color = "Series"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+
+```
