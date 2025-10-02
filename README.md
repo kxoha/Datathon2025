@@ -1,5 +1,6 @@
 # GRB Co. Supply Chain Forecasting — Datathon Project
 
+### The file 'extra.qmd' has the main code portion for the models.
 ## Problem Statement
 GRB Co., a mid-tier consumer goods firm, faces declining profitability despite stable demand. The root cause lies in escalating logistics costs and systemic inefficiencies across its supply chain. This project leverages data-driven forecasting to identify cost drivers, improve logistics efficiency, and support strategic decision-making.
 
